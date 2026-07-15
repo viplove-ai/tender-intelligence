@@ -1,0 +1,12 @@
+# Production dependencies are pinned so local installs and deployments use the
+# same tested versions. Upgrade these deliberately and rerun the verification
+# commands documented in README.md.
+-c constraints.txt
+
+streamlit==1.59.2
+pandas==2.3.3
+openpyxl==3.1.5
+xlrd==2.0.2
+plotly==6.9.0
+pypdf==6.14.2
+streamlit-js-eval==1.0.0

@@ -1,0 +1,8 @@
+-r requirements.txt
+
+# Development-only tools. pytest 9.0.3 fixed CVE-2025-71176; keep the
+# development environment on a patched release.
+pytest==9.1.1
+pip-audit==2.10.1
+ruff==0.15.21
+bandit==1.9.4
