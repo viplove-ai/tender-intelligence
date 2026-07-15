@@ -49,7 +49,7 @@ The application opens at <http://localhost:8501>. Keep the terminal open while u
 ## Importing tender reports
 
 1. Open **Dashboard**.
-2. Upload one or more CPWD `.xls` or `.xlsx` reports, each no larger than 5 MB. Bundled sample data is also available for evaluation.
+2. Upload one or more CPWD `.xls` or `.xlsx` reports, each no larger than 5 MB. Ready-made public CPWD data is also available by region.
 3. Optionally enter a Division override.
 4. Review the detected fields, new/updated/unchanged counts, warnings, rejected rows, and preview.
 5. Press **Confirm Import**.
@@ -58,7 +58,7 @@ Imports are transactional. Reimporting a compatible Tender ID updates useful cha
 
 ## Dashboard and contractor analysis
 
-Dashboard filters apply to its metrics, charts, and tender table. The contractor pages provide searchable award histories, comparisons for up to five contractors, weighted results, work patterns, and annual trends.
+Dashboard filters apply to its metrics, charts, and tender table. The Contractors page provides a searchable profile and comparison tabs: award histories, comparisons for up to five contractors, weighted results, work patterns, and annual trends.
 
 To remove an incorrect office slice, open **Delete tenders by region / office** on the Dashboard:
 

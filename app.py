@@ -263,7 +263,7 @@ px.defaults.color_discrete_sequence = CPWD_CATEGORICAL
 px.defaults.color_continuous_scale = CPWD_CONTINUOUS
 
 
-PAGES = ["Tender Analysis & Bid Estimator", "Dashboard", "Contractor Search", "Contractor Comparison"]
+PAGES = ["Tender Analysis & Bid Estimator", "Dashboard", "Contractors"]
 # A brand-new browser (empty per-session database) is steered to the Dashboard, which
 # renders the import UI itself until the first CPWD award report has been added.
 ONBOARDING_PAGES = ["Dashboard"]
@@ -335,24 +335,24 @@ def money_chart(frame: pd.DataFrame, value_column: str, axis: str = "y", **kwarg
     chart(plotted, labels=labels, **kwargs)
 
 
-def sample_data_details(df: pd.DataFrame) -> tuple[list[str], pd.Timestamp | None]:
-    """Return bundled sample regions and their latest tender date."""
+def bundled_data_details(df: pd.DataFrame) -> tuple[list[str], pd.Timestamp | None]:
+    """Return bundled public-data regions and their latest tender date."""
     if df.empty or "source_file" not in df:
         return [], None
-    sample_mask = pd.Series(False, index=df.index)
+    bundled_mask = pd.Series(False, index=df.index)
     regions = set()
     for source_file in df["source_file"].dropna().astype(str).unique():
-        match = SAMPLE_FILE_PATTERN.fullmatch(Path(source_file).stem)
+        match = BUNDLED_DATA_FILE_PATTERN.fullmatch(Path(source_file).stem)
         if not match:
             continue
         regions.add(re.sub(r"[_-]+", " ", match.group("region")).strip().title())
-        sample_mask |= df["source_file"].eq(source_file)
+        bundled_mask |= df["source_file"].eq(source_file)
     if not regions:
         return [], None
     date_values = []
     for column in ("bid_opening_datetime", "submission_closing_datetime"):
         if column in df:
-            date_values.append(pd.to_datetime(df.loc[sample_mask, column], errors="coerce", format="mixed"))
+            date_values.append(pd.to_datetime(df.loc[bundled_mask, column], errors="coerce", format="mixed"))
     valid_dates = pd.concat(date_values).dropna() if date_values else pd.Series(dtype="datetime64[ns]")
     latest = valid_dates.max() if not valid_dates.empty else None
     return sorted(regions), latest
@@ -366,15 +366,15 @@ def dashboard_page(df: pd.DataFrame):
         # No data yet: the Dashboard itself acts as the onboarding / import screen.
         render_import_ui(onboarding=True)
         return
-    sample_regions, sample_through = sample_data_details(df)
-    if sample_regions:
-        region_text = ", ".join(sample_regions)
+    bundled_regions, data_through = bundled_data_details(df)
+    if bundled_regions:
+        region_text = ", ".join(bundled_regions)
         date_text = (
-            f" Data available through {sample_through.day} {sample_through:%B %Y}, based on the latest tender date."
-            if sample_through is not None
+            f" Data available through {data_through.day} {data_through:%B %Y}, based on the latest tender date."
+            if data_through is not None
             else ""
         )
-        st.info(f"You are viewing bundled sample data for {region_text}.{date_text}")
+        st.info(f"You are viewing public CPWD tender data for {region_text}.{date_text}")
     st.caption("A consolidated view of local CPWD tender and award records. Filters apply to every metric and chart below.")
     add_col, delete_col = st.columns(2)
     with add_col:
@@ -438,21 +438,21 @@ def dashboard_page(df: pd.DataFrame):
 
 
 MASTER_DATA_DIR = Path(__file__).resolve().parent / "master_data"
-SAMPLE_FILE_PATTERN = re.compile(r"^region_cpwd_(?P<region>.+)$", re.IGNORECASE)
+BUNDLED_DATA_FILE_PATTERN = re.compile(r"^region_cpwd_(?P<region>.+)$", re.IGNORECASE)
 
 
-def available_sample_files() -> list[Path]:
-    """Excel reports bundled with the app that a user can load instead of their own."""
+def available_bundled_data_files() -> list[Path]:
+    """Public CPWD Excel reports bundled with the app for ready-made loading."""
     if not MASTER_DATA_DIR.exists():
         return []
     return sorted(p for p in MASTER_DATA_DIR.iterdir() if p.suffix.lower() in {".xls", ".xlsx"})
 
 
-def available_sample_regions() -> dict[str, Path]:
+def available_bundled_data_regions() -> dict[str, Path]:
     """Map region labels to files named ``region_cpwd_<region>.xls[x]``."""
     regions = {}
-    for path in available_sample_files():
-        match = SAMPLE_FILE_PATTERN.fullmatch(path.stem)
+    for path in available_bundled_data_files():
+        match = BUNDLED_DATA_FILE_PATTERN.fullmatch(path.stem)
         if not match:
             continue
         label = re.sub(r"[_-]+", " ", match.group("region")).strip().title()
@@ -461,15 +461,15 @@ def available_sample_regions() -> dict[str, Path]:
     return dict(sorted(regions.items()))
 
 
-def load_sample_dataset(region: str, sample_file: Path) -> None:
+def load_bundled_dataset(region: str, data_file: Path) -> None:
     """Import one selected region's bundled report into this browser's database."""
-    if sample_file not in available_sample_files():
-        st.session_state["import_error"] = "The selected sample dataset is not available."
+    if data_file not in available_bundled_data_files():
+        st.session_state["import_error"] = "The selected CPWD dataset is not available."
         st.rerun()
     try:
         totals = {key: 0 for key in ("inserted_rows", "updated_rows", "unchanged_rows", "rejected_rows")}
-        with centered_loader(f"Loading the {region} sample tender dataset…"):
-            items = prepare_import_batch([(sample_file.read_bytes(), sample_file.name)])
+        with centered_loader(f"Loading public CPWD data for {region}…"):
+            items = prepare_import_batch([(data_file.read_bytes(), data_file.name)])
             for preview, _ in items:
                 if preview.validation_errors:
                     raise ValueError("; ".join(preview.validation_errors))
@@ -479,14 +479,14 @@ def load_sample_dataset(region: str, sample_file: Path) -> None:
             sync_to_browser()
         st.session_state.pop("import_error", None)
         st.session_state["post_import_message"] = (
-            f"{region} sample dataset loaded: {totals['inserted_rows']} tenders added"
+            f"{region} CPWD data loaded: {totals['inserted_rows']} tenders added"
             + (f", {totals['unchanged_rows']} already present." if totals["unchanged_rows"] else ".")
         )
         st.session_state["pending_nav"] = "Dashboard"
         st.rerun()
     except Exception:
-        LOG.exception("Sample data load failed")
-        st.session_state["import_error"] = "The sample dataset could not be loaded. See the server log for details."
+        LOG.exception("Bundled CPWD data load failed")
+        st.session_state["import_error"] = "The CPWD dataset could not be loaded. See the server log for details."
         st.rerun()
 
 
@@ -499,25 +499,25 @@ def render_import_ui(onboarding: bool = False):
             "from the CPWD e-Tendering website and upload it below. Once imported, the dashboard and "
             "contractor tabs unlock."
         )
-    sample_regions = available_sample_regions()
-    if sample_regions:
+    bundled_regions = available_bundled_data_regions()
+    if bundled_regions:
         with st.container(border=True):
             st.markdown(
-                "**No report handy?** Choose a region and use its bundled CPWD sample dataset to explore "
-                "the app right away. You can clear or replace it at any time."
+                "**Load public CPWD data** Choose a region to use the ready-made tender records. "
+                "You can clear or replace them at any time."
             )
             selected_region = st.selectbox(
                 "Choose a region",
-                options=list(sample_regions),
-                key="sample_region",
+                options=list(bundled_regions),
+                key="bundled_data_region",
             )
             if st.button(
-                f"📊 Use {selected_region} sample data",
-                key="load_sample_data",
+                f"📊 Load {selected_region} CPWD data",
+                key="load_bundled_data",
                 on_click=begin_action,
-                args=(f"Loading the {selected_region} sample tender dataset…",),
+                args=(f"Loading public CPWD data for {selected_region}…",),
             ):
-                load_sample_dataset(selected_region, sample_regions[selected_region])
+                load_bundled_dataset(selected_region, bundled_regions[selected_region])
         st.caption("— or import your own report below —")
     st.write("Upload one or more CPWD `.xls` or `.xlsx` reports. Nothing is saved until you review the preview and press **Confirm Import**.")
     division = st.text_input("Division override (optional)", help="Leave blank to detect it from Tender Publishing Office.")
@@ -680,16 +680,26 @@ def render_delete_region_ui(df: pd.DataFrame):
             st.error(str(exc))
 
 
-def contractor_search_page(df: pd.DataFrame):
-    st.title("Contractor Search")
+def contractors_page(df: pd.DataFrame):
+    """Single contractor page: an individual profile and a side-by-side comparison,
+    merged into tabs so contractor intelligence lives in one place."""
+    st.title("Contractors")
     awards = df[df["is_awarded"]] if not df.empty else df
     names = safe_options(awards.get("contractor_name", pd.Series(dtype=str)))
     if not names:
         st.info("No awarded contractor records are available yet.")
         return
+    award_counts = awards["contractor_name"].value_counts()
+    profile_tab, compare_tab = st.tabs(["Profile", "Compare"])
+    with profile_tab:
+        _contractor_profile_section(awards, names, award_counts)
+    with compare_tab:
+        _contractor_comparison_section(awards, names, award_counts)
+
+
+def _contractor_profile_section(awards: pd.DataFrame, names: list, award_counts: pd.Series):
     query = st.text_input("Search contractor")
     matches = [name for name in names if query.casefold() in name.casefold()]
-    award_counts = awards["contractor_name"].value_counts()
     name = st.selectbox("Select contractor", matches or names, format_func=lambda value: f"{value} — {int(award_counts.get(value, 0)):,} awards")
     group = awards[awards["contractor_name"] == name].copy()
     metrics = contractor_metrics(group)
@@ -715,11 +725,7 @@ def contractor_search_page(df: pd.DataFrame):
     show_table(group)
 
 
-def comparison_page(df: pd.DataFrame):
-    st.title("Contractor Comparison")
-    awards = df[df["is_awarded"]] if not df.empty else df
-    names = safe_options(awards.get("contractor_name", pd.Series(dtype=str)))
-    award_counts = awards["contractor_name"].value_counts()
+def _contractor_comparison_section(awards: pd.DataFrame, names: list, award_counts: pd.Series):
     chosen = st.multiselect("Select up to five contractors", names, max_selections=5,
                             format_func=lambda value: f"{value} — {int(award_counts.get(value, 0)):,} awards")
     if not chosen:
@@ -1368,10 +1374,8 @@ st.html(
 try:
     if page == "Dashboard":
         dashboard_page(data)
-    elif page == "Contractor Search":
-        contractor_search_page(data)
-    elif page == "Contractor Comparison":
-        comparison_page(data)
+    elif page == "Contractors":
+        contractors_page(data)
     elif page == "Tender Analysis & Bid Estimator":
         estimator_page(data)
 except Exception:

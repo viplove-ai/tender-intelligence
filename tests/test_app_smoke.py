@@ -14,13 +14,13 @@ def test_app_bootstraps_without_exceptions():
         ("Choose a region", ["Chandigarh", "Lucknow"]),
     ]
     buttons = {button.label: button for button in app.button}
-    assert set(buttons) == {"📊 Use Chandigarh sample data", "↻ Reset website"}
+    assert set(buttons) == {"📊 Load Chandigarh CPWD data", "↻ Reset website"}
 
     app.selectbox[0].set_value("Lucknow").run()
 
     assert not app.exception
     buttons = {button.label: button for button in app.button}
-    assert set(buttons) == {"📊 Use Lucknow sample data", "↻ Reset website"}
+    assert set(buttons) == {"📊 Load Lucknow CPWD data", "↻ Reset website"}
 
     buttons["↻ Reset website"].click().run()
 
@@ -51,7 +51,7 @@ def test_reset_confirmation_keeps_the_current_page():
     app.session_state["_tender_data_cache"] = None
     app.run()
     assert any(
-        "bundled sample data for Lucknow" in info.value
+        "public CPWD tender data for Lucknow" in info.value
         and "31 July 2026" in info.value
         for info in app.info
     )
