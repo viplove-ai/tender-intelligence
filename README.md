@@ -219,3 +219,7 @@ Do not loosen production version ranges for automatic upgrades. To upgrade delib
 - **`npm install` succeeds but `node_modules/electron/dist` has only a license file, no `Electron.app`:** a very new/nightly Node.js version can silently truncate Electron's own postinstall zip extraction. Use a current LTS Node release (20 or 22) instead.
 - **`npm run serve` throws `Cannot read properties of undefined (reading 'enableSandbox')`:** something in your shell has `ELECTRON_RUN_AS_NODE=1` set, which forces Electron to run as plain Node instead of launching its GUI runtime. Unset it (`env -u ELECTRON_RUN_AS_NODE npm run serve`) and retry.
 - **Desktop app shows `ModuleNotFoundError` or a Python `TypeError` at startup:** almost always a Pyodide packaging mismatch, not an app bug — see "Known packaging constraints" above.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Contact: [viplove.chaudhary@linux.com](mailto:viplove.chaudhary@linux.com).

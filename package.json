@@ -4,6 +4,8 @@
   "private": true,
   "description": "Tender Intelligence packaged as an installable desktop app via stlite (Pyodide/WASM) and Electron.",
   "main": "./build/electron/main.js",
+  "license": "MIT",
+  "author": "Viplove Chaudhary <viplove.chaudhary@linux.com>",
   "scripts": {
     "predump": "node scripts/write-platform-marker.js",
     "dump": "dump-stlite-desktop-artifacts",
