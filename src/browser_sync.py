@@ -4,7 +4,13 @@ import base64
 import binascii
 import hashlib
 
-from streamlit_js_eval import streamlit_js_eval
+from .persistence import IS_WASM
+
+# streamlit-js-eval isn't installable under Pyodide, and this module's WASM-only
+# consumers (database.py's restore/validate helpers) never touch streamlit_js_eval, so
+# only server mode needs to import it.
+if not IS_WASM:
+    from streamlit_js_eval import streamlit_js_eval
 
 DB_NAME = "tender_intelligence"
 STORE_NAME = "kv"

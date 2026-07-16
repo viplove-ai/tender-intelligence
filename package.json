@@ -1,0 +1,72 @@
+{
+  "name": "tender-intelligence-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tender Intelligence packaged as an installable desktop app via stlite (Pyodide/WASM) and Electron.",
+  "main": "./build/electron/main.js",
+  "scripts": {
+    "predump": "node scripts/write-platform-marker.js",
+    "dump": "dump-stlite-desktop-artifacts",
+    "serve": "cross-env NODE_ENV=production electron .",
+    "app:dir": "electron-builder --dir",
+    "app:dist": "electron-builder",
+    "checksum": "node scripts/checksum-installer.js",
+    "postinstall": "electron-builder install-app-deps"
+  },
+  "build": {
+    "appId": "org.cpwd.tenderintelligence",
+    "productName": "Tender Intelligence",
+    "files": [
+      "build/**/*"
+    ],
+    "directories": {
+      "buildResources": "assets"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.business",
+      "artifactName": "Tender-Intelligence.dmg"
+    },
+    "win": {
+      "target": "nsis",
+      "artifactName": "Tender-Intelligence-Setup.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    }
+  },
+  "devDependencies": {
+    "@stlite/desktop": "^0.101.1",
+    "cross-env": "^7.0.3",
+    "electron": "34.3.0",
+    "electron-builder": "^25.1.8"
+  },
+  "stlite": {
+    "desktop": {
+      "entrypoint": "app.py",
+      "files": [
+        "app.py",
+        "package.json",
+        "desktop_platform.txt",
+        "src/*.py",
+        "master_data/*.xls"
+      ],
+      "dependencies": [
+        "pandas",
+        "plotly==5.24.1",
+        "pypdf",
+        "openpyxl",
+        "xlrd",
+        "sqlite3"
+      ],
+      "nodeJsWorker": true,
+      "nodefsMountpoints": {
+        "/mnt": "{{userData}}"
+      }
+    }
+  },
+  "allowScripts": {
+    "electron@34.3.0": true
+  }
+}

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
+import json
 import logging
 import re
 import sqlite3
 import tempfile
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -34,6 +36,8 @@ from src.exporter import build_database_backup
 from src.guarantee import calculate_performance_guarantee
 from src.importer import commit_import_batch, prepare_import_batch
 from src.nit_parser import NITExtraction, extract_nit_pdf
+from src.persistence import IS_WASM, resolve_data_dir
+from src.persistence import sync_after_write as _sync_after_write_shim
 from src.prediction import estimate_bid
 from src.utils import configure_logging
 
@@ -120,7 +124,22 @@ def _bootstrap_session_database() -> None:
     st.rerun()
 
 
-_bootstrap_session_database()
+def _bootstrap_wasm_database() -> None:
+    """Point the session at the desktop build's persistent host-mounted directory.
+
+    Under stlite (WASM) there is no browser IndexedDB round trip to await: the NODEFS
+    mount already puts the SQLite file on the user's real disk, so the database is ready
+    on the very first script run.
+    """
+    db_path = resolve_data_dir() / "tender_intelligence.db"
+    st.session_state["session_db_path"] = db_path
+    set_session_db_path(db_path)
+
+
+if IS_WASM:
+    _bootstrap_wasm_database()
+else:
+    _bootstrap_session_database()
 initialize_database()
 if st.session_state.pop("session_db_corrupt_warning", False):
     st.warning("Your previously saved data in this browser could not be read and was reset. Please re-import your reports.")
@@ -129,16 +148,25 @@ if st.session_state.pop("session_db_corrupt_warning", False):
 def sync_to_browser() -> None:
     """Push the session's current SQLite state back into the browser's IndexedDB.
 
-    Uses SQLite's backup API rather than reading the raw file: in WAL mode recent commits
-    live in the -wal sidecar and are not yet reflected in the main .db file, so a plain
-    read would persist a stale snapshot (e.g. a deletion would reappear after a refresh).
-    backup() produces a single consistent file that includes all committed changes.
+    Server mode only — see sync_after_write() for the runtime-agnostic call site every
+    mutating action actually uses. Uses SQLite's backup API rather than reading the raw
+    file: in WAL mode recent commits live in the -wal sidecar and are not yet reflected
+    in the main .db file, so a plain read would persist a stale snapshot (e.g. a deletion
+    would reappear after a refresh). backup() produces a single consistent file that
+    includes all committed changes.
     """
     db_path = st.session_state.get("session_db_path")
     if db_path and Path(db_path).exists():
         save_db_bytes_to_browser(build_database_backup(db_path))
-    # Every caller invokes this after a database mutation. Ensure the next rerun
-    # observes fresh rows without putting private per-session data in a global cache.
+
+
+def sync_after_write() -> None:
+    """Flush the database after a mutation, then invalidate the cached tender table so
+    the next rerun observes fresh rows. Delegates to sync_to_browser() in server mode;
+    a no-op in WASM mode, where NODEFS writes are already durable — see src/persistence.py.
+    """
+    _sync_after_write_shim(sync_to_browser)
+    # Never put private per-session data in a global cache.
     st.session_state.pop("_tender_data_cache", None)
 
 
@@ -156,14 +184,14 @@ def restore_session_database(data: bytes) -> None:
     """Integrity-check a downloaded backup and atomically restore this session."""
     db_path = Path(st.session_state["session_db_path"])
     restore_database_bytes(data, db_path)
-    sync_to_browser()
+    sync_after_write()
 
 
 def reset_entire_app() -> None:
     """Reset this browser's database and discard all page-specific session state."""
     db_path = Path(st.session_state["session_db_path"])
     reset_database(db_path)
-    sync_to_browser()
+    sync_after_write()
 
     # Keep the live session database plumbing, but discard navigation, filters,
     # previews, calculations, and widget values from every page.
@@ -183,6 +211,335 @@ def show_reset_confirmation() -> None:
 
 def hide_reset_confirmation() -> None:
     st.session_state["show_master_reset_confirmation"] = False
+
+
+GITHUB_REPO = "viplove-ai/tender-intelligence-desktop"
+# electron-builder's artifactName is pinned (see package.json) to these exact, version-free
+# filenames specifically so this permalink pattern keeps working across every future
+# release without the web app needing to know the current version number.
+DESKTOP_DOWNLOAD_MAC = f"https://github.com/{GITHUB_REPO}/releases/latest/download/Tender-Intelligence.dmg"
+DESKTOP_DOWNLOAD_WINDOWS = f"https://github.com/{GITHUB_REPO}/releases/latest/download/Tender-Intelligence-Setup.exe"
+# scripts/checksum-installer.js (run in CI right after electron-builder) publishes these
+# alongside each installer so the desktop app can verify what it downloads.
+DESKTOP_CHECKSUM_MAC = DESKTOP_DOWNLOAD_MAC + ".sha256"
+DESKTOP_CHECKSUM_WINDOWS = DESKTOP_DOWNLOAD_WINDOWS + ".sha256"
+DESKTOP_RELEASES_PAGE = f"https://github.com/{GITHUB_REPO}/releases/latest"
+LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# Real installers run ~150-300MB; this is a sanity ceiling against the WASM heap, not a
+# realistic expectation — see download_and_verify_installer's docstring for the caveat.
+MAX_INSTALLER_BYTES = 400 * 1024 * 1024
+
+
+def _detect_os_download() -> tuple[str | None, str]:
+    """Best-guess OS from the browser's User-Agent header, and its matching installer URL.
+
+    Web/server mode only. Verified against a real browser UA; does NOT work inside the
+    desktop build itself (see _current_desktop_platform for why) — stlite's internal
+    websocket bridge exposes only a synthetic {'Host': 'stlite.local', ...}, no real UA.
+    """
+    user_agent = (st.context.headers or {}).get("User-Agent", "")
+    if "Windows" in user_agent:
+        return "Windows", DESKTOP_DOWNLOAD_WINDOWS
+    if "Macintosh" in user_agent or "Mac OS X" in user_agent:
+        return "macOS", DESKTOP_DOWNLOAD_MAC
+    return None, DESKTOP_RELEASES_PAGE
+
+
+def _current_desktop_platform() -> str | None:
+    """Which OS this desktop build targets — baked in at build time, not detected live.
+
+    scripts/write-platform-marker.js writes desktop_platform.txt before every
+    `npm run dump` (package.json's predump hook), once per platform-specific CI job. This
+    is necessary, not just convenient: confirmed against the real Electron build that
+    st.context.headers carries no real browser User-Agent to sniff the way _detect_os_download
+    does in server mode, so there's no live signal to detect the host OS from in here.
+    """
+    try:
+        return (Path(__file__).parent / "desktop_platform.txt").read_text().strip() or None
+    except Exception:
+        return None
+
+
+def _desktop_download_and_checksum() -> tuple[str, str, str] | None:
+    """(installer_url, checksum_url, file_name) for this build's own platform, or None."""
+    platform_name = _current_desktop_platform()
+    if platform_name == "macOS":
+        return DESKTOP_DOWNLOAD_MAC, DESKTOP_CHECKSUM_MAC, "Tender-Intelligence.dmg"
+    if platform_name == "Windows":
+        return DESKTOP_DOWNLOAD_WINDOWS, DESKTOP_CHECKSUM_WINDOWS, "Tender-Intelligence-Setup.exe"
+    return None
+
+
+def _current_app_version() -> str | None:
+    """Read this build's version out of the bundled package.json.
+
+    package.json is listed in stlite.desktop.files so it ships next to app.py in the
+    desktop build too — one shared source of truth for the version number instead of a
+    second copy that can silently drift from the one electron-builder actually stamps.
+    """
+    try:
+        return json.loads((Path(__file__).parent / "package.json").read_text())["version"]
+    except Exception:
+        return None
+
+
+def _latest_release_tag() -> str | None:
+    """Fetch the newest release's tag from GitHub. Only ever called under Pyodide.
+
+    There are no real sockets in WASM — this goes through Pyodide's browser-fetch bridge,
+    which @stlite's Node worker polyfills. Verified end-to-end against the real Electron
+    build (got a genuine HTTP response back through pyfetch); the caller still treats any
+    exception here as "couldn't check right now" rather than letting it crash the app,
+    since real-world failures (offline, rate-limited) are still possible.
+    """
+    import pyodide.http
+
+    async def _get() -> str | None:
+        response = await pyodide.http.pyfetch(LATEST_RELEASE_API, headers={"Accept": "application/vnd.github+json"})
+        if response.status != 200:
+            return None
+        data = await response.json()
+        return data.get("tag_name")
+
+    return asyncio.run(_get())
+
+
+def _pyfetch_bytes(url: str, *, max_bytes: int = MAX_INSTALLER_BYTES) -> bytes:
+    """Fetch a URL's full body as bytes via Pyodide's browser-fetch bridge.
+
+    Verified in the real Electron build that pyfetch's response exposes a working
+    .bytes() returning a plain Python bytes object. Not re-verified at actual
+    installer size (150-300MB) in this environment — only against small JSON payloads —
+    so treat the first real-world run of this path as the real test. Aborts before
+    reading the body if the server advertises a size over max_bytes; if the server omits
+    Content-Length, this check is silently skipped rather than blocking the download.
+    """
+    import pyodide.http
+
+    async def _get() -> bytes:
+        response = await pyodide.http.pyfetch(url)
+        response.raise_for_status()
+        try:
+            content_length = int(response.headers.get("content-length"))
+        except Exception:
+            content_length = None
+        if content_length is not None and content_length > max_bytes:
+            raise ValueError(f"Refusing to download {content_length} bytes (limit {max_bytes})")
+        return await response.bytes()
+
+    return asyncio.run(_get())
+
+
+def _pyfetch_text(url: str) -> str | None:
+    """Fetch a small text file (the checksum sidecar). None on any failure — a missing or
+    unreachable checksum means "can't verify", handled by the caller, not a hard error."""
+    import pyodide.http
+
+    async def _get() -> str | None:
+        response = await pyodide.http.pyfetch(url)
+        if response.status != 200:
+            return None
+        return await response.string()
+
+    try:
+        return asyncio.run(_get())
+    except Exception:
+        return None
+
+
+UPDATE_CHECK_INTERVAL_DAYS = 30
+UPDATE_STATE_FILENAME = "update_check_state.json"
+
+
+def _update_state_path() -> Path:
+    return resolve_data_dir() / UPDATE_STATE_FILENAME
+
+
+def _load_update_state() -> dict[str, str]:
+    try:
+        return json.loads(_update_state_path().read_text())
+    except Exception:
+        return {}
+
+
+def _save_update_state(state: dict[str, str]) -> None:
+    try:
+        _update_state_path().write_text(json.dumps(state))
+    except Exception:
+        LOG.warning("Couldn't persist update-check state", exc_info=True)
+
+
+def maybe_check_for_updates_in_background() -> None:
+    """Silently check for a new desktop release at most once per
+    UPDATE_CHECK_INTERVAL_DAYS, persisted in a small state file next to the database so
+    the cadence survives app restarts — session state alone wouldn't, since it resets
+    every relaunch. Only ever surfaces UI (an "info" banner + install button, wired up by
+    the caller) when an update is actually pending; up-to-date and "couldn't check right
+    now" are both silent, so a monthly network hiccup never interrupts normal use.
+
+    Every failure mode here — a missing/corrupt state file, no network, a GitHub API
+    hiccup, a malformed response — is caught and swallowed. Worst case is "no update
+    surfaced this run, try again next cycle," never a broken app. This function is called
+    unconditionally on every page render, so it must never let an exception escape.
+    """
+    if not IS_WASM or st.session_state.get("_update_check_attempted_this_session"):
+        return
+    st.session_state["_update_check_attempted_this_session"] = True
+    try:
+        current = _current_app_version()
+        state = _load_update_state()
+
+        # The app may have been updated since this was last written (user downloaded and
+        # reinstalled) — reconcile the stale flag before deciding what to show, even if a
+        # fresh network check isn't due yet.
+        if current and state.get("update_available_version") == current:
+            state.pop("update_available_version", None)
+
+        last_checked_raw = state.get("last_checked")
+        due = True
+        if last_checked_raw:
+            try:
+                due = (datetime.utcnow() - datetime.fromisoformat(last_checked_raw)) >= timedelta(
+                    days=UPDATE_CHECK_INTERVAL_DAYS
+                )
+            except Exception:
+                due = True
+
+        if due:
+            st.session_state.pop("_installer_result", None)
+            st.session_state.pop("_installer_bytes", None)
+            try:
+                latest_tag = _latest_release_tag()
+            except Exception:
+                LOG.warning("Scheduled update check failed", exc_info=True)
+                latest_tag = None
+            state["last_checked"] = datetime.utcnow().isoformat()
+            if latest_tag is not None:
+                latest_version = latest_tag.removeprefix("desktop-v")
+                if current and latest_version != current:
+                    state["update_available_version"] = latest_version
+                else:
+                    state.pop("update_available_version", None)
+
+        _save_update_state(state)
+
+        pending_version = state.get("update_available_version")
+        if pending_version:
+            st.session_state["_update_check_result"] = (
+                "info",
+                f"Version {pending_version} is available (you have {current or 'an earlier version'}).",
+            )
+    except Exception:
+        LOG.warning("Background update check failed unexpectedly", exc_info=True)
+
+
+def download_and_verify_installer() -> None:
+    """Fetch this platform's installer, verify it against the published SHA256, and stage
+    it in session state so a real st.download_button can hand it to the user to save.
+
+    The version-check's small-JSON fetch is verified end-to-end against the real Electron
+    build (see _latest_release_tag). This function reuses the same pyfetch mechanism for a
+    much larger binary payload (150-300MB) — not separately verified at that size here, so
+    the first real release is the real test of the download half of this path.
+    """
+    target = _desktop_download_and_checksum()
+    if target is None:
+        st.session_state["_installer_result"] = (
+            "warning",
+            f"Don't know which installer this build is — [download manually]({DESKTOP_RELEASES_PAGE}) instead.",
+        )
+        return
+    download_url, checksum_url, file_name = target
+
+    try:
+        installer_bytes = _pyfetch_bytes(download_url)
+    except Exception:
+        LOG.warning("Installer download failed", exc_info=True)
+        st.session_state["_installer_result"] = (
+            "error",
+            f"Couldn't download the installer. [Try the direct link]({download_url}) in your browser instead.",
+        )
+        return
+
+    expected_line = _pyfetch_text(checksum_url)
+    expected_hash = expected_line.split()[0].lower() if expected_line else None
+    actual_hash = hashlib.sha256(installer_bytes).hexdigest()
+
+    if expected_hash and actual_hash != expected_hash:
+        st.session_state["_installer_result"] = (
+            "error",
+            f"Downloaded file failed checksum verification (expected {expected_hash[:12]}…, "
+            f"got {actual_hash[:12]}…). Discarded — try again or "
+            f"[download manually]({download_url}).",
+        )
+        return
+
+    st.session_state["_installer_bytes"] = installer_bytes
+    st.session_state["_installer_file_name"] = file_name
+    st.session_state["_installer_result"] = (
+        "success",
+        "Downloaded and verified against the published checksum. Save it below, then quit "
+        "and run it to install."
+        if expected_hash
+        else "Downloaded (no published checksum to verify against yet). Save it below, then "
+        "quit and run it to install.",
+    )
+
+
+def render_masthead() -> None:
+    """CPWD-style gradient title bar with one action slot on the right: a desktop
+    download link in server/cloud mode. In the desktop build, the update check itself
+    runs silently in the background (see maybe_check_for_updates_in_background) — there's
+    no manual button; an install prompt only appears below the masthead when a newer
+    release is actually available.
+    """
+    maybe_check_for_updates_in_background()
+    with st.container(key="masthead_row"):
+        title_col, action_col = st.columns([5, 1], vertical_alignment="center")
+        with title_col:
+            st.html(
+                """
+                <div style="display:flex;align-items:center;gap:15px;">
+                  <span style="font-size:1.75rem;line-height:1;">🏛️</span>
+                  <div>
+                    <div style="color:#ffffff;font-size:1.2rem;font-weight:700;letter-spacing:.3px;">Tender Intelligence</div>
+                    <div style="color:#c4e4ec;font-size:.8rem;margin-top:2px;">Historical CPWD tender analysis &amp; transparent bid estimation</div>
+                  </div>
+                </div>
+                """
+            )
+        with action_col:
+            if not IS_WASM:
+                os_label, download_url = _detect_os_download()
+                st.link_button(
+                    f"Download for {os_label}" if os_label else "Get desktop app",
+                    download_url,
+                    width="stretch",
+                )
+    # .get(), not .pop(): these need to survive the rerun the "Download & verify" and
+    # "Save installer" buttons themselves trigger, so the offer doesn't vanish the moment
+    # the user acts on it. maybe_check_for_updates_in_background() clears the installer
+    # keys whenever it runs a fresh check, so a stale offer can't outlive it.
+    if result := st.session_state.get("_update_check_result"):
+        level, message = result
+        getattr(st, level)(message)
+        if level == "info" and _desktop_download_and_checksum() is not None:
+            if st.button("Download & verify installer", key="download_verify_installer_btn"):
+                with st.spinner("Downloading and verifying — this can take a while for a large installer…"):
+                    download_and_verify_installer()
+
+    if result := st.session_state.get("_installer_result"):
+        level, message = result
+        getattr(st, level)(message)
+
+    if "_installer_bytes" in st.session_state:
+        st.download_button(
+            "Save installer",
+            data=st.session_state["_installer_bytes"],
+            file_name=st.session_state.get("_installer_file_name", "installer"),
+            mime="application/octet-stream",
+            key="save_installer_btn",
+        )
 
 
 def render_master_reset() -> None:
@@ -220,10 +577,20 @@ def render_master_reset() -> None:
             )
 
 
-st.html(
+st.markdown(
     """<style>
-    /* Keep custom CSS limited to semantic HTML owned by this app. Streamlit's
-       internal data-testid and generated class names are intentionally untouched. */
+    /* Custom CSS targets either semantic HTML this app owns, the st-key-<key> hook
+       Streamlit adds for a widget's own key=, or a stable data-testid — never the
+       auto-generated st-emotion-cache-* class names, which are unstable across Streamlit
+       versions (this app's two runtimes bundle two different ones: 1.59 server, 1.57
+       desktop) and would silently stop matching on the next upgrade.
+
+       This is deliberately st.markdown(..., unsafe_allow_html=True), not st.html(): when
+       an st.html() call's content is *only* <style> tags, Streamlit routes it through a
+       separate "event container" path (added for its own issue #9388, to dodge DOMPurify
+       stripping bare <style> tags) that empirically does not reliably keep applying in
+       this app — confirmed by direct inspection, isolated repros, and comparison against
+       this exact st.markdown call, which does not hit that path and works every time. */
     h1,h2,h3{color:#0e4a58;font-weight:700}
     h1{letter-spacing:.2px}
     .muted{color:#5b6b73}.below{color:#15803d}.above{color:#b91c1c}
@@ -231,7 +598,38 @@ st.html(
     details summary{font-weight:600;color:#0e4a58}
     .st-key-show_master_reset button{background:#b91c1c;border-color:#b91c1c;color:#fff}
     .st-key-show_master_reset button:hover{background:#991b1b;border-color:#991b1b;color:#fff}
-    </style>"""
+    .st-key-masthead_row{background:linear-gradient(90deg,#014464 0%,#125b6c 62%,#16788f 100%);
+        padding:15px 24px;border-radius:12px;margin-bottom:16px;box-shadow:0 2px 6px rgba(1,68,100,.18);}
+    .st-key-masthead_row button,.st-key-masthead_row a[data-testid="stBaseLinkButton-secondary"]{
+        background:#ffffff;color:#0e4a58;border-color:#ffffff;font-weight:600;}
+    .st-key-masthead_row button:hover,.st-key-masthead_row a[data-testid="stBaseLinkButton-secondary"]:hover{
+        background:#e7f1f3;color:#0e4a58;border-color:#e7f1f3;}
+
+    /* Sidebar navigation: reskin the plain st.radio as a vertical tab list. */
+    section[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p{
+        font-size:.72rem;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#5b6b73;}
+    section[data-testid="stSidebar"] [data-testid="stRadioGroup"]{gap:3px;width:100%;}
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"]{
+        display:flex;align-items:center;width:100%;box-sizing:border-box;
+        padding:10px 14px;border-radius:8px;cursor:pointer;
+        border-left:3px solid transparent;
+        transition:background-color .15s ease,color .15s ease,border-color .15s ease;}
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"] > div{width:100%;}
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"] [data-testid="stMarkdownContainer"] p{
+        margin:0;font-weight:500;color:#0e4a58;transition:color .15s ease;}
+    /* The circle-drawing div is always the first child before the label's markdown
+       container — a DOM-order rule, not an emotion-cache class, so it survives a
+       Streamlit version bump between the two runtimes. */
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"] > div > div > div:first-child{
+        display:none;}
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"]:hover{
+        background:#eaf4f6;border-left-color:#8ec3cf;}
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"]{
+        background:#125b6c;border-left-color:#e0a458;}
+    section[data-testid="stSidebar"] [data-testid="stRadioOption"][data-selected="true"] [data-testid="stMarkdownContainer"] p{
+        color:#ffffff;font-weight:700;}
+    </style>""",
+    unsafe_allow_html=True,
 )
 
 
@@ -476,7 +874,7 @@ def load_bundled_dataset(region: str, data_file: Path) -> None:
             for result in commit_import_batch(items):
                 for key in totals:
                     totals[key] += result[key]
-            sync_to_browser()
+            sync_after_write()
         st.session_state.pop("import_error", None)
         st.session_state["post_import_message"] = (
             f"{region} CPWD data loaded: {totals['inserted_rows']} tenders added"
@@ -585,7 +983,7 @@ def render_import_ui(onboarding: bool = False):
             for result in results:
                 for key in totals:
                     totals[key] += result[key]
-            sync_to_browser()
+            sync_after_write()
             st.session_state.pop("import_previews", None)
             st.session_state.pop("import_signature", None)
             st.session_state.pop("import_error", None)
@@ -674,7 +1072,7 @@ def render_delete_region_ui(df: pd.DataFrame):
     ):
         try:
             deleted = delete_tenders_by_filters(delete_filters)
-            sync_to_browser()
+            sync_after_write()
             st.success(f"Deleted {deleted:,} tenders. You can now import the corrected reports again.")
         except ValueError as exc:
             st.error(str(exc))
@@ -1038,7 +1436,7 @@ def estimator_page(df: pd.DataFrame):
             confirm_delete = delete_col.checkbox("Confirm delete", disabled=selected_saved_id is None)
             if delete_col.button("Delete saved analysis", disabled=selected_saved_id is None or not confirm_delete, width="stretch"):
                 delete_tender_analysis(int(selected_saved_id))
-                sync_to_browser()
+                sync_after_write()
                 if st.session_state.get("active_saved_analysis_id") == selected_saved_id:
                     clear_analysis_workspace()
                 else:
@@ -1340,7 +1738,7 @@ def estimator_page(df: pd.DataFrame):
             "result": result, "costing_result": costing_result, "estimated": estimated, "extraction": extraction,
         }
         st.session_state["pg_whatif_percent"] = float(planned_bid_percent)
-        sync_to_browser()
+        sync_after_write()
         st.success("Tender analysis updated." if active_id else "Tender analysis saved. You can load, re-run, replace, or delete it from Saved tender analyses.")
 
     bundle = st.session_state.get("analysis_render")
@@ -1357,20 +1755,7 @@ if pending_nav := st.session_state.pop("pending_nav", None):
     if pending_nav in nav_options:
         st.session_state["nav_page"] = pending_nav
 page = st.sidebar.radio("Navigation", nav_options, key="nav_page")
-# CPWD-style masthead: teal→navy gradient band echoing the e-Tendering portal banner.
-st.html(
-    """
-    <div style="background:linear-gradient(90deg,#014464 0%,#125b6c 62%,#16788f 100%);
-                padding:15px 24px;border-radius:12px;margin-bottom:16px;
-                display:flex;align-items:center;gap:15px;box-shadow:0 2px 6px rgba(1,68,100,.18);">
-      <span style="font-size:1.75rem;line-height:1;">🏛️</span>
-      <div>
-        <div style="color:#ffffff;font-size:1.2rem;font-weight:700;letter-spacing:.3px;">Tender Intelligence</div>
-        <div style="color:#c4e4ec;font-size:.8rem;margin-top:2px;">Historical CPWD tender analysis &amp; transparent bid estimation</div>
-      </div>
-    </div>
-    """
-)
+render_masthead()
 try:
     if page == "Dashboard":
         dashboard_page(data)

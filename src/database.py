@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from .cleaning import normalize_contractor_name, parse_publishing_office, preferred_display_name
+from .persistence import IS_WASM
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -40,8 +41,26 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
+    _configure_journal_mode(conn)
     return conn
+
+
+def _configure_journal_mode(conn: sqlite3.Connection) -> None:
+    """WAL needs shared-memory (-shm) support that WASM filesystem mounts (NODEFS/IDBFS)
+    may not provide. SQLite doesn't raise when it can't switch modes — it silently keeps
+    the previous mode and reports that back — so check the reported mode rather than
+    catching an exception; also guard the call itself in case a mount rejects it outright.
+    """
+    if not IS_WASM:
+        conn.execute("PRAGMA journal_mode=WAL")
+        return
+    try:
+        row = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        mode = row[0] if row else None
+    except sqlite3.OperationalError:
+        mode = None
+    if mode is None or str(mode).lower() != "wal":
+        conn.execute("PRAGMA journal_mode=DELETE")
 
 
 @contextmanager
